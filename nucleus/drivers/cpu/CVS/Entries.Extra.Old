@@ -1,0 +1,5 @@
+/.cvsignore///
+/bugs.c///
+/cpu.c///
+/cpu_k6.c///
+/cpu_mhz.c///

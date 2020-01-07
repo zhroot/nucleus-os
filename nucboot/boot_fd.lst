@@ -1,0 +1,269 @@
+     1                                  [BITS 16]
+     2                                  [ORG 0x7C00]
+     3                                  
+     4 00000000 EB3C                    jmp Entry
+     5 00000002 90                      nop
+     6                                       
+     7 00000003 4E55434C45555330             OEM_ID                db "NUCLEUS0"
+     8 0000000B 0002                         BytesPerSector        dw 0x0200
+     9 0000000D 01                           SectorsPerCluster     db 0x01
+    10 0000000E 0100                         ReservedSectors       dw 0x0001
+    11 00000010 02                           TotalFATs             db 0x02
+    12 00000011 E000                         MaxRootEntries        dw 0x00E0
+    13 00000013 400B                         TotalSectorsSmall     dw 0x0B40
+    14 00000015 F0                           MediaDescriptor       db 0xF0
+    15 00000016 0900                         SectorsPerFAT         dw 0x0009
+    16 00000018 1200                         SectorsPerTrack       dw 0x0012
+    17 0000001A 0200                         NumHeads              dw 0x0002
+    18 0000001C 00000000                     HiddenSectors         dd 0x00000000
+    19 00000020 00000000                     TotalSectorsLarge     dd 0x00000000
+    20 00000024 00                           DriveNumber           db 0x00
+    21 00000025 00                           Flags                 db 0x00
+    22 00000026 29                           Signature             db 0x29
+    23 00000027 0DD001C0                     VolumeID              dd 0xC001D00D
+    24 0000002B 4E55434C455553424F-          VolumeLabel           db "NUCLEUSBOOT"
+    25 00000034 4F54               
+    26 00000036 4641543132202020             SystemID              db "FAT12   "
+    27                                  
+    28                                  Entry:
+    29                                       ; code located at 0000:7C00, adjust segment registers
+    30 0000003E EA[4300]0000            	jmp 0x0000:_Start
+    31                                  
+    32                                  _Start:
+    33 00000043 FA                                cli
+    34 00000044 8CC8                              mov     ax, cs
+    35 00000046 8ED8                              mov     ds, ax
+    36 00000048 8EC0                              mov     es, ax
+    37 0000004A 8EE0                              mov     fs, ax
+    38 0000004C 8EE8                              mov     gs, ax
+    39 0000004E 8816[2400]                        mov     [DriveNumber],dl		; Use drive number passed from BIOS
+    40                                       ; create stack
+    41 00000052 8ED0                              mov     ss, ax
+    42 00000054 BCF8FF                            mov     sp, 0xFFF8
+    43 00000057 FB                                sti
+    44                                       ; post message
+    45 00000058 BE[C501]                          mov     si, msgLoading
+    46 0000005B E8CF00                            call    DisplayMessage
+    47                                  LOAD_ROOT:
+    48                                       ; compute size of root directory and store in ‘cx’
+    49 0000005E 31C9                              xor     cx, cx
+    50 00000060 31D2                              xor     dx, dx
+    51 00000062 B82000                            mov     ax, 0x0020                          ; 32 byte directory entry
+    52 00000065 F726[1100]                        mul     WORD [MaxRootEntries]               ; total size of directory
+    53 00000069 F736[0B00]                        div     WORD [BytesPerSector]               ; sectors used by directory
+    54 0000006D 91                                xchg    ax, cx
+    55                                       ; compute location of root directory and store in ‘ax’
+    56 0000006E A0[1000]                          mov     al, BYTE [TotalFATs]                ; number of FATs
+    57 00000071 F726[1600]                        mul     WORD [SectorsPerFAT]                ; sectors used by FATs
+    58 00000075 0306[0E00]                        add     ax, WORD [ReservedSectors]          ; adjust for bootsector
+    59 00000079 A3[B601]                          mov     WORD [datasector], ax               ; base of root directory
+    60 0000007C 010E[B601]                        add     WORD [datasector], cx
+    61                                  
+    62 00000080 BE[D001]                          mov     si, msgDir
+    63 00000083 E8A700                            call    DisplayMessage
+    64                                  
+    65                                       ; read root directory into memory
+    66 00000086 BB[0002]                          mov     bx, Buffer                          ; copy root dir above bootcode
+    67 00000089 E8B300                            call    ReadSectors
+    68                                       ; browse root directory for binary image
+    69 0000008C 8B0E[1100]                        mov     cx, WORD [MaxRootEntries]           ; load loop counter
+    70 00000090 BF[0002]                          mov     di, Buffer                          ; locate first root entry
+    71 00000093 1E                      		  push ds
+    72 00000094 07                      		  pop es
+    73                                       .LOOP:
+    74 00000095 51                                push    cx
+    75 00000096 B90B00                            mov     cx, 0x000B                          ; eleven character name
+    76 00000099 BE[BA01]                          mov     si, ImageName                       ; image name to find
+    77 0000009C 57                                push    di
+    78 0000009D F3A6                         rep  cmpsb                                       ; test for entry match
+    79 0000009F 5F                                pop     di
+    80 000000A0 7408                              je      LOAD_FAT
+    81 000000A2 59                                pop     cx
+    82 000000A3 83C720                            add     di, 0x0020                          ; queue next directory entry
+    83 000000A6 E2ED                              loop    .LOOP
+    84 000000A8 EB77                              jmp     FAILURE
+    85                                       LOAD_FAT:
+    86                                       ; save starting cluster of boot image
+    87 000000AA BE[D401]                          mov     si, msgFat
+    88 000000AD E87D00                            call    DisplayMessage
+    89                                  
+    90 000000B0 8B551A                            mov     dx, WORD [di + 0x001A]
+    91 000000B3 8916[B801]                        mov     WORD [cluster], dx                  ; file’s first cluster
+    92                                       ; compute size of FAT and store in ‘cx’
+    93 000000B7 31C0                              xor     ax, ax
+    94 000000B9 A0[1000]                          mov     al, BYTE [TotalFATs]                ; number of FATs
+    95 000000BC F726[1600]                        mul     WORD [SectorsPerFAT]                ; sectors used by FATs
+    96 000000C0 89C1                              mov     cx, ax
+    97                                       ; compute location of FAT and store in ‘ax’
+    98 000000C2 A1[0E00]                          mov     ax, WORD [ReservedSectors]          ; adjust for bootsector
+    99                                       ; read FAT into memory
+   100 000000C5 BB[0002]                          mov     bx, Buffer                          ; copy FAT above bootcode
+   101 000000C8 E87400                            call    ReadSectors
+   102                                       ; read image file into memory (0000:0500)
+   103 000000CB BE[D801]                          mov     si, msgLdr
+   104 000000CE E85C00                            call    DisplayMessage
+   105 000000D1 BB0005                            mov     bx, 0x0500                          ; destination for image
+   106 000000D4 53                                push    bx
+   107                                       LOAD_IMAGE:
+   108 000000D5 A1[B801]                          mov     ax, WORD [cluster]                  ; cluster to read
+   109 000000D8 5B                                pop     bx                                  ; buffer to read into
+   110 000000D9 E8AD00                            call    ClusterLBA                          ; convert cluster to LBA
+   111 000000DC 31C9                              xor     cx, cx
+   112 000000DE 8A0E[0D00]                        mov     cl, BYTE [SectorsPerCluster]        ; sectors to read
+   113 000000E2 E85A00                            call    ReadSectors
+   114 000000E5 53                                push    bx                                  ; compute next cluster
+   115 000000E6 A1[B801]                          mov     ax, WORD [cluster]                  ; identify current cluster
+   116 000000E9 89C1                              mov     cx, ax                              ; copy current cluster
+   117 000000EB 89C2                              mov     dx, ax                              ; copy current cluster
+   118 000000ED D1EA                              shr     dx, 1                               ; divide by two
+   119 000000EF 01D1                              add     cx, dx                              ; sum for (3/2)
+   120 000000F1 BB[0002]                          mov     bx, Buffer                          ; location of FAT in memory
+   121 000000F4 01CB                              add     bx, cx                              ; index into FAT
+   122 000000F6 8B17                              mov     dx, WORD [bx]                       ; read two bytes from FAT
+   123 000000F8 A90100                            test    ax, 0x0001
+   124 000000FB 7506                              jnz     .ODD_CLUSTER
+   125                                       .EVEN_CLUSTER:
+   126 000000FD 81E2FF0F                          and     dx, 0000111111111111b               ; take low twelve bits
+   127 00000101 EB03                             jmp     .DONE
+   128                                       .ODD_CLUSTER:
+   129 00000103 C1EA04                            shr     dx, 0x0004                          ; take high twelve bits
+   130                                       .DONE:
+   131 00000106 8916[B801]                        mov     WORD [cluster], dx                  ; store new cluster
+   132 0000010A 81FAF00F                          cmp     dx, 0x0FF0                          ; test for end of file
+   133 0000010E 72C5                              jb      LOAD_IMAGE
+   134                                  ;    DONE:
+   135 00000110 BE[DF01]                          mov     si, msgCRLF
+   136 00000113 E81700                            call    DisplayMessage
+   137                                  
+   138 00000116 660FB616[2400]          		  movzx   edx,byte [DriveNumber]
+   139                                  
+   140 0000011C EA00050000              		  jmp word 0x0000:0x0500
+   141                                       FAILURE:
+   142 00000121 BE[E601]                          mov     si, msgFailure
+   143 00000124 E80600                            call    DisplayMessage
+   144 00000127 B400                              mov     ah, 0x00
+   145 00000129 CD16                              int     0x16                                ; await keypress
+   146 0000012B CD19                              int     0x19                                ; warm boot computer
+   147                                       
+   148                                       ;*************************************************************************
+   149                                       ; PROCEDURE DisplayMessage
+   150                                       ; display ASCIIZ string at ds:si via BIOS
+   151                                       ;*************************************************************************
+   152                                       DisplayMessage:
+   153 0000012D 60                      	      pusha
+   154                                  
+   155                                  .more
+   156 0000012E AC                                lodsb                                       ; load next character
+   157 0000012F 08C0                              or      al, al                              ; test for NUL character
+   158 00000131 740A                              jz      .DONE
+   159 00000133 B40E                              mov     ah, 0x0E                            ; BIOS teletype
+   160 00000135 B700                              mov     bh, 0x00                            ; display page 0
+   161 00000137 B307                              mov     bl, 0x07                            ; text attribute
+   162 00000139 CD10                              int     0x10                                ; invoke BIOS
+   163 0000013B EBF1                              jmp     .more
+   164                                       .DONE:
+   165                                  
+   166 0000013D 61                      	      popa
+   167 0000013E C3                                ret
+   168                                       
+   169                                       ;*************************************************************************
+   170                                       ; PROCEDURE ReadSectors
+   171                                       ; reads ‘cx’ sectors from disk starting at ‘ax’ into
+   172                                       ; memory location ‘es:bx’
+   173                                  	 ; es:bx is moved ahead to after the last byte read
+   174                                       ;*************************************************************************
+   175                                       ReadSectors:
+   176                                       .MAIN
+   177 0000013F BF0500                            mov     di, 0x0005                          ; five retries for error
+   178                                       .SECTORLOOP
+   179 00000142 60                                pusha
+   180 00000143 E85300                            call    LBACHS
+   181 00000146 B402                              mov     ah, 0x02                            ; BIOS read sector
+   182 00000148 B001                              mov     al, 0x01                            ; read one sector
+   183 0000014A 8A2E[B501]                        mov     ch, BYTE [absoluteTrack]            ; track
+   184 0000014E 8A0E[B301]                        mov     cl, BYTE [absoluteSector]           ; sector
+   185 00000152 8A36[B401]                        mov     dh, BYTE [absoluteHead]             ; head
+   186 00000156 8A16[2400]                        mov     dl, BYTE [DriveNumber]              ; drive
+   187 0000015A CD13                              int     0x13                                ; invoke BIOS
+   188 0000015C 7310                              jnc     .SUCCESS                            ; test for read error
+   189                                  
+   190 0000015E BE[E401]                		  mov si, msgBadProgress
+   191 00000161 E8C9FF                  		  call DisplayMessage
+   192                                  
+   193 00000164 31C0                              xor     ax, ax                              ; BIOS reset disk
+   194 00000166 CD13                              int     0x13                                ; invoke BIOS
+   195 00000168 61                                popa
+   196 00000169 4F                                dec     di                                  ; decrement error counter
+   197 0000016A 75D6                              jnz     .SECTORLOOP                         ; attempt to read again
+   198 0000016C CD18                              int     0x18                                ; that was very bad, reboot
+   199                                       .SUCCESS
+   200 0000016E BE[E201]                          mov     si, msgProgress
+   201 00000171 E8B9FF                            call    DisplayMessage
+   202 00000174 61                                popa
+   203 00000175 031E[0B00]                        add     bx, WORD [BytesPerSector]           ; queue next buffer
+   204 00000179 730A                    		  jnc .no_seg_carry
+   205 0000017B 53                      		  push bx
+   206 0000017C 8CC3                    		  mov bx,es
+   207 0000017E 81C30010                		  add bx,0x1000
+   208 00000182 8EC3                    		  mov es,bx
+   209 00000184 5B                      		  pop bx
+   210                                  .no_seg_carry
+   211 00000185 40                                inc     ax                                  ; queue next sector
+   212 00000186 E2B7                              loop    .MAIN                               ; read next sector
+   213 00000188 C3                                ret
+   214                                       
+   215                                       ;*************************************************************************
+   216                                       ; PROCEDURE ClusterLBA
+   217                                       ; convert FAT cluster into LBA addressing scheme
+   218                                       ; LBA = (cluster - 2) * sectors per cluster
+   219                                       ;*************************************************************************
+   220                                       ClusterLBA:
+   221 00000189 83E802                            sub     ax, 0x0002                          ; zero base cluster number
+   222 0000018C 31C9                              xor     cx, cx
+   223 0000018E 8A0E[0D00]                        mov     cl, BYTE [SectorsPerCluster]        ; convert byte to word
+   224 00000192 F7E1                              mul     cx
+   225 00000194 0306[B601]                        add     ax, WORD [datasector]               ; base data sector
+   226 00000198 C3                                ret
+   227                                       
+   228                                       ;*************************************************************************
+   229                                       ; PROCEDURE LBACHS
+   230                                       ; convert ‘ax’ LBA addressing scheme to CHS addressing scheme
+   231                                       ; absolute sector = (logical sector / sectors per track) + 1
+   232                                       ; absolute head   = (logical sector / sectors per track) MOD number of heads
+   233                                       ; absolute track  = logical sector / (sectors per track * number of heads)
+   234                                       ;*************************************************************************
+   235                                       LBACHS:
+   236 00000199 31D2                              xor     dx, dx                              ; prepare dx:ax for operation
+   237 0000019B F736[1800]                        div     WORD [SectorsPerTrack]              ; calculate
+   238 0000019F FEC2                              inc     dl                                  ; adjust for sector 0
+   239 000001A1 8816[B301]                        mov     BYTE [absoluteSector], dl
+   240 000001A5 31D2                              xor     dx, dx                              ; prepare dx:ax for operation
+   241 000001A7 F736[1A00]                        div     WORD [NumHeads]                     ; calculate
+   242 000001AB 8816[B401]                        mov     BYTE [absoluteHead], dl
+   243 000001AF A2[B501]                          mov     BYTE [absoluteTrack], al
+   244 000001B2 C3                                ret
+   245                                  
+   246 000001B3 00                           absoluteSector db 0x00
+   247 000001B4 00                           absoluteHead   db 0x00
+   248 000001B5 00                           absoluteTrack  db 0x00
+   249                                       
+   250 000001B6 0000                         datasector		dw 0x0000
+   251 000001B8 0000                         cluster		dw 0x0000
+   252 000001BA 4E55434C4F41442053-          ImageName		db "NUCLOAD SYS"
+   253 000001C3 5953               
+   254 000001C5 4C6F6164696E672E2E-          msgLoading		db "Loading...", 0x00
+   255 000001CE 2E00               
+   256 000001D0 44697200                	 msgDir         db "Dir", 0x00
+   257 000001D4 46415400                	 msgFat         db "FAT", 0x00
+   258 000001D8 4C6F6164657200          	 msgLdr         db "Loader", 0x00
+   259 000001DF 0D0A00                       msgCRLF		db 0x0D, 0x0A, 0x00
+   260 000001E2 2E00                         msgProgress	db ".", 0x00
+   261 000001E4 3F00                    	 msgBadProgress db "?", 0x00
+   262 000001E6 0D0A4C6F6164657220-          msgFailure		db 0x0D, 0x0A, "Loader not found!", 0x00
+   263 000001EF 6E6F7420666F756E64-
+   264 000001F8 2100               
+   265                                       
+   266 000001FA 00<rept>                          TIMES 510-($-$$) DB 0
+   267 000001FE 55AA                              DW 0xAA55
+   268                                  
+   269                                  Buffer:

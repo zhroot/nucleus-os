@@ -1,0 +1,4 @@
+This version fixes the following bugs:
+- no cursor in text mode
+- boot loader for real PC's (not only Bochs)
+- more stable (A20 gate, etc.)

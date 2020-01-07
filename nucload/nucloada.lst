@@ -1,0 +1,1222 @@
+     1                                  [BITS 16]
+     2                                  
+     3                                  [GLOBAL _ReadCHS]
+     4                                  [GLOBAL _CopyToExt]
+     5                                  [GLOBAL _EnterKernel]
+     6                                  [GLOBAL _enable_A20]
+     7                                  [GLOBAL _disable_A20]
+     8                                  [GLOBAL _detect_A20_type]
+     9                                  
+    10                                  [EXTERN _PrintString]
+    11                                  
+    12                                  ; - Compile switches begin -------------
+    13                                  %define USE_REAL_DELAY		1
+    14                                  %define USE_MSG_DELAY		0
+    15                                  ; - Compile switches end ---------------
+    16                                  
+    17                                  [SECTION .data]
+    18                                  
+    19                                  ; Function pointers initialized by A20 detection code
+    20                                  times ($$-$) & 3 nop
+    21 00000000 00000000                _ena_A20_vec	dd 0
+    22 00000004 00000000                _dis_A20_vec	dd 0
+    23                                  
+    24                                  ; This is the *real* GDT that gets loaded before jumping to kernel
+    25                                  [GLOBAL gdtr]
+    26                                  times ($$-$) & 3 nop
+    27 00000008 0000                    	dw 0
+    28                                  gdtr:
+    29 0000000A 2700                    	dw gdt_end-gdt-1	; Limit
+    30 0000000C [10000000]              	dd gdt				; Linear address
+    31                                  
+    32                                  times ($$-$) & 7 nop
+    33                                  gdt:
+    34 00000010 00000000                	dd 0
+    35 00000014 00000000                	dd 0
+    36                                  
+    37                                  code4g_gdt:		; Code descriptor: 4 GB
+    38 00000018 FFFF                    	dw 0xFFFF	; Limit = 4 GB
+    39 0000001A 0000                    	dw 0x0000	; Base  0-15
+    40 0000001C 00                      	db 0x00 	; Base 16-23
+    41 0000001D 9A                      	db 0x9A 	; Code
+    42 0000001E CF                      	db 0xCF 	; Page granularity
+    43 0000001F 00                      	db 0x00 	; Base 24-31
+    44                                  
+    45                                  data4g_gdt:		; Data descriptor: 4 GB
+    46 00000020 FFFF                    	dw 0xFFFF	; Limit = 4 GB
+    47 00000022 0000                    	dw 0x0000	; base Bits 0-15
+    48 00000024 00                      	db 0x00 	; base Bits 16-23
+    49 00000025 93                      	db 0x93 	; Data segment
+    50 00000026 CF                      	db 0xCF 	; Page granularity
+    51 00000027 00                      	db 0x00 	; base Bits 24-31
+    52                                  
+    53                                  code64k_gdt:
+    54 00000028 FFFF                    	dw 0xFFFF	; Limit = 64 KB
+    55 0000002A 0000                    	dw 0x0000	; Base  0-15
+    56 0000002C 00                      	db 0x00 	; Base 16-23
+    57 0000002D 9A                      	db 0x9A 	; Code
+    58 0000002E 00                      	db 0x00 	; Byte granularity
+    59 0000002F 00                      	db 0x00 	; Base 24-31
+    60                                  
+    61                                  data64k_gdt:
+    62 00000030 FFFF                    	dw 0xFFFF	; Limit = 64 KB
+    63 00000032 0000                    	dw 0x0000	; base Bits 0-15
+    64 00000034 00                      	db 0x00 	; base Bits 16-23
+    65 00000035 93                      	db 0x93 	; Data segment
+    66 00000036 00                      	db 0x00 	; Byte granularity
+    67 00000037 00                      	db 0x00 	; base Bits 24-31
+    68                                  
+    69                                  gdt_end:
+    70                                  
+    71                                  [SECTION .text]
+    72                                  
+    73                                  ; ------------------
+    74                                  %macro safemsg 1+
+    75                                  %if 1
+    76                                  	jmp %%overtext
+    77                                  %%msg: db 10,%1,10,0
+    78                                  %%overtext:
+    79                                  	pushad
+    80                                  o32	push es
+    81                                  	mov ax,0xb800
+    82                                  	mov es,ax
+    83                                  	mov esi,%%msg
+    84                                  	xor di,di
+    85                                  %%another:
+    86                                  	lodsb
+    87                                  	cmp al,0
+    88                                  	jz %%done
+    89                                  	stosb
+    90                                  	mov al,7
+    91                                  	stosb
+    92                                  	jmp %%another
+    93                                  %%done:
+    94                                  
+    95                                  	mov ax,0x0800
+    96                                  %%another2:
+    97                                  	stosw
+    98                                  	cmp di,80*2
+    99                                  	jb %%another2
+   100                                  
+   101                                  %if USE_MSG_DELAY
+   102                                  	mov ecx,200000000
+   103                                  %else
+   104                                  	mov ecx,1
+   105                                  %endif
+   106                                  
+   107                                  %%spin:
+   108                                  	dec ecx
+   109                                  	jnz %%spin
+   110                                  
+   111                                  o32	pop es
+   112                                  	popad
+   113                                  %endif
+   114                                  %endmacro
+   115                                  
+   116                                  ; ------------------
+   117                                  %macro safemsg_pm 1+
+   118                                  %if 1
+   119                                  jmp %%overtext
+   120                                  %%msg db 10,%1,10,0
+   121                                  %%overtext:
+   122                                  	pushad
+   123                                  	mov esi,%%msg
+   124                                  	mov edi,0xB8000
+   125                                  %%another:
+   126                                  	lodsb
+   127                                  	cmp al,0
+   128                                  	jz %%done
+   129                                  	stosb
+   130                                  	mov al,7
+   131                                  	stosb
+   132                                  	jmp %%another
+   133                                  %%done:
+   134                                  
+   135                                  	mov ax,0x0800
+   136                                  %%another2:
+   137                                  	stosw
+   138                                  	cmp edi,0xB8000 + 80*2
+   139                                  	jb %%another2
+   140                                  
+   141                                  %if USE_MSG_DELAY
+   142                                  	mov ecx,200000000
+   143                                  %else
+   144                                  	mov ecx,1
+   145                                  %endif
+   146                                  
+   147                                  %%spin:
+   148                                  	dec ecx
+   149                                  	jnz %%spin
+   150                                  
+   151                                  	popad
+   152                                  %endif
+   153                                  %endmacro
+   154                                  
+   155                                  ; ------------------
+   156                                  ; // Returns true on success
+   157                                  ; STATIC word ReadCHS(void *dest, dword drv, dword c, dword h, dword s)
+   158                                  _ReadCHS:
+   159 00000000 6655                    	push ebp
+   160 00000002 6689E5                  	mov ebp,esp
+   161 00000005 6683EC04                	sub esp,4
+   162 00000009 6653                    	push ebx
+   163 0000000B 6656                    	push esi
+   164 0000000D 6657                    	push edi
+   165                                  
+   166                                  	; 5 retries
+   167 0000000F C746FC0500              	mov word [bp-4],5
+   168                                  
+   169                                  .retry:
+   170 00000014 8B5E08                  	mov bx,[bp+8]		; mem
+   171 00000017 8A560C                  	mov dl,[bp+12]		; drive
+   172 0000001A 8A6E10                  	mov ch,[bp+16]		; cylinder
+   173 0000001D 8A7614                  	mov dh,[bp+20]		; head
+   174 00000020 8A4E18                  	mov cl,[bp+24]		; sector
+   175 00000023 B80102                  	mov ax,0x0201		; read sector
+   176 00000026 CD13                    	int 0x13			; Disk BIOS
+   177 00000028 7306                    	jnc .ok
+   178 0000002A FF4EFC                  	dec word [bp-4]		; Retry counter
+   179 0000002D 75E5                    	jnz .retry
+   180 0000002F F9                      	stc
+   181                                  .ok:
+   182 00000030 0F93C0                  	setnc al
+   183 00000033 660FB6C0                	movzx eax,al
+   184                                  
+   185 00000037 665F                    	pop edi
+   186 00000039 665E                    	pop esi
+   187 0000003B 665B                    	pop ebx
+   188 0000003D 66C9                    o32	leave
+   189 0000003F 66C3                    o32	ret
+   190                                  
+   191                                  ; ------------------
+   192                                  _CopyToExt:
+   193 00000041 6655                    	push ebp
+   194 00000043 6689E5                  	mov ebp,esp
+   195                                  
+   196 00000046 6653                    	push ebx
+   197 00000048 6656                    	push esi
+   198 0000004A 6657                    	push edi
+   199 0000004C 6655                    	push ebp
+   200                                  
+   201 0000004E 66E8C2010000            	call dword _enable_A20
+   202                                  
+   203 00000054 66B8[0A000000]          	mov eax,gdtr
+   204 0000005A 670F0110                	lgdt [eax]
+   205                                  
+   206 0000005E 0F20C0                  	mov eax,cr0
+   207                                  	; Enable native FPU exception handling and enable protected mode
+   208 00000061 6683C821                	or eax,0x00000021
+   209 00000065 0F22C0                  	mov cr0,eax
+   210                                  
+   211 00000068 EB01                    	jmp .clear_pfq
+   212 0000006A 90                      	nop
+   213                                  .clear_pfq:
+   214                                  
+   215 0000006B 668B7608                	mov esi,[bp+8]
+   216 0000006F 668B7E0C                	mov edi,[bp+12]
+   217 00000073 668B4E10                	mov ecx,[bp+16]
+   218                                  
+   219 00000077 66EA[80000000]0800      	jmp dword 0x0008:.pmode
+   220                                  ;	push dword 8
+   221                                  ;	push dword .pmode
+   222                                  ;o32	retf
+   223                                  
+   224 0000007F 90                      	nop
+   225                                  .pmode:
+   226                                  [BITS 32]
+   227                                  	; Protected mode
+   228                                  
+   229 00000080 B810000000              	mov eax,0x10
+   230 00000085 8ED8                    	mov ds,ax
+   231 00000087 8EC0                    	mov es,ax
+   232 00000089 8ED0                    	mov ss,ax
+   233                                  
+   234                                  	safemsg_pm "In protected mode"
+   235                              <1> %if 1
+   236 0000008B EB14                <1> jmp %%overtext
+   237 0000008D 0A496E2070726F7465- <1> %%msg db 10,%1,10,0
+   238 00000096 63746564206D6F6465- <1>
+   239 0000009F 0A00                <1>
+   240                              <1> %%overtext:
+   241 000000A1 60                  <1>  pushad
+   242 000000A2 BE[8D000000]        <1>  mov esi,%%msg
+   243 000000A7 BF00800B00          <1>  mov edi,0xB8000
+   244                              <1> %%another:
+   245 000000AC AC                  <1>  lodsb
+   246 000000AD 3C00                <1>  cmp al,0
+   247 000000AF 7406                <1>  jz %%done
+   248 000000B1 AA                  <1>  stosb
+   249 000000B2 B007                <1>  mov al,7
+   250 000000B4 AA                  <1>  stosb
+   251 000000B5 EBF5                <1>  jmp %%another
+   252                              <1> %%done:
+   253                              <1> 
+   254 000000B7 66B80008            <1>  mov ax,0x0800
+   255                              <1> %%another2:
+   256 000000BB 66AB                <1>  stosw
+   257 000000BD 81FFA0800B00        <1>  cmp edi,0xB8000 + 80*2
+   258 000000C3 72F6                <1>  jb %%another2
+   259                              <1> 
+   260                              <1> %if USE_MSG_DELAY
+   261                              <1>  mov ecx,200000000
+   262                              <1> %else
+   263 000000C5 B901000000          <1>  mov ecx,1
+   264                              <1> %endif
+   265                              <1> 
+   266                              <1> %%spin:
+   267 000000CA 49                  <1>  dec ecx
+   268 000000CB 75FD                <1>  jnz %%spin
+   269                              <1> 
+   270 000000CD 61                  <1>  popad
+   271                              <1> %endif
+   272                                  
+   273                                  ;	mov esi,[ebp+8]
+   274                                  ;	mov edi,[ebp+12]
+   275                                  ;	mov ecx,[ebp+16]
+   276 000000CE FC                      	cld
+   277 000000CF F3A4                    	rep movsb
+   278                                  
+   279                                  	safemsg_pm "Done copy"
+   280                              <1> %if 1
+   281 000000D1 EB0C                <1> jmp %%overtext
+   282 000000D3 0A446F6E6520636F70- <1> %%msg db 10,%1,10,0
+   283 000000DC 790A00              <1>
+   284                              <1> %%overtext:
+   285 000000DF 60                  <1>  pushad
+   286 000000E0 BE[D3000000]        <1>  mov esi,%%msg
+   287 000000E5 BF00800B00          <1>  mov edi,0xB8000
+   288                              <1> %%another:
+   289 000000EA AC                  <1>  lodsb
+   290 000000EB 3C00                <1>  cmp al,0
+   291 000000ED 7406                <1>  jz %%done
+   292 000000EF AA                  <1>  stosb
+   293 000000F0 B007                <1>  mov al,7
+   294 000000F2 AA                  <1>  stosb
+   295 000000F3 EBF5                <1>  jmp %%another
+   296                              <1> %%done:
+   297                              <1> 
+   298 000000F5 66B80008            <1>  mov ax,0x0800
+   299                              <1> %%another2:
+   300 000000F9 66AB                <1>  stosw
+   301 000000FB 81FFA0800B00        <1>  cmp edi,0xB8000 + 80*2
+   302 00000101 72F6                <1>  jb %%another2
+   303                              <1> 
+   304                              <1> %if USE_MSG_DELAY
+   305                              <1>  mov ecx,200000000
+   306                              <1> %else
+   307 00000103 B901000000          <1>  mov ecx,1
+   308                              <1> %endif
+   309                              <1> 
+   310                              <1> %%spin:
+   311 00000108 49                  <1>  dec ecx
+   312 00000109 75FD                <1>  jnz %%spin
+   313                              <1> 
+   314 0000010B 61                  <1>  popad
+   315                              <1> %endif
+   316                                  
+   317                                  	; Load CS register for real mode
+   318 0000010C EA[13010000]1800        	jmp dword 0x0018:.loadcsrm
+   319                                  .loadcsrm:
+   320                                  
+   321                                  	; Load segment registers for real mode
+   322 00000113 B820000000              	mov eax,0x0020
+   323 00000118 8ED8                    	mov ds,ax
+   324 0000011A 8EC0                    	mov es,ax
+   325 0000011C 8EE0                    	mov fs,ax
+   326 0000011E 8EE8                    	mov gs,ax
+   327 00000120 8ED0                    	mov ss,ax
+   328                                  
+   329 00000122 0F20C0                  	mov eax,cr0
+   330 00000125 48                      	dec eax
+   331 00000126 0F22C0                  	mov cr0,eax
+   332                                  
+   333 00000129 EB01                    	jmp .clear_pfq2
+   334 0000012B 90                      	nop
+   335                                  .clear_pfq2:
+   336                                  
+   337 0000012C EA[34010000]0000        	jmp dword 0x0000:.rmode
+   338                                  
+   339 00000133 90                      	nop
+   340                                  .rmode:
+   341                                  [BITS 16]
+   342                                  	; Real mode
+   343                                  
+   344 00000134 31C0                    	xor ax,ax
+   345 00000136 8ED8                    	mov ds,ax
+   346 00000138 8EC0                    	mov es,ax
+   347 0000013A 8EE0                    	mov fs,ax
+   348 0000013C 8EE8                    	mov gs,ax
+   349 0000013E 8ED0                    	mov ss,ax
+   350                                  
+   351                                  	safemsg "Back to real mode"
+   352                              <1> %if 1
+   353 00000140 EB14                <1>  jmp %%overtext
+   354 00000142 0A4261636B20746F20- <1> %%msg: db 10,%1,10,0
+   355 0000014B 7265616C206D6F6465- <1>
+   356 00000154 0A00                <1>
+   357                              <1> %%overtext:
+   358 00000156 6660                <1>  pushad
+   359 00000158 6606                <1> o32 push es
+   360 0000015A B800B8              <1>  mov ax,0xb800
+   361 0000015D 8EC0                <1>  mov es,ax
+   362 0000015F 66BE[42010000]      <1>  mov esi,%%msg
+   363 00000165 31FF                <1>  xor di,di
+   364                              <1> %%another:
+   365 00000167 AC                  <1>  lodsb
+   366 00000168 3C00                <1>  cmp al,0
+   367 0000016A 7406                <1>  jz %%done
+   368 0000016C AA                  <1>  stosb
+   369 0000016D B007                <1>  mov al,7
+   370 0000016F AA                  <1>  stosb
+   371 00000170 EBF5                <1>  jmp %%another
+   372                              <1> %%done:
+   373                              <1> 
+   374 00000172 B80008              <1>  mov ax,0x0800
+   375                              <1> %%another2:
+   376 00000175 AB                  <1>  stosw
+   377 00000176 81FFA000            <1>  cmp di,80*2
+   378 0000017A 72F9                <1>  jb %%another2
+   379                              <1> 
+   380                              <1> %if USE_MSG_DELAY
+   381                              <1>  mov ecx,200000000
+   382                              <1> %else
+   383 0000017C 66B901000000        <1>  mov ecx,1
+   384                              <1> %endif
+   385                              <1> 
+   386                              <1> %%spin:
+   387 00000182 6649                <1>  dec ecx
+   388 00000184 75FC                <1>  jnz %%spin
+   389                              <1> 
+   390 00000186 6607                <1> o32 pop es
+   391 00000188 6661                <1>  popad
+   392                              <1> %endif
+   393                                  
+   394 0000018A 66E8AA000000            	call dword _disable_A20
+   395                                  
+   396 00000190 665D                    	pop ebp
+   397 00000192 665F                    	pop edi
+   398 00000194 665E                    	pop esi
+   399 00000196 665B                    	pop ebx
+   400 00000198 66C9                    o32	leave
+   401 0000019A 66C3                    o32	ret
+   402                                  
+   403                                  ; ------------------
+   404                                  ; Delay approximately 20ms
+   405                                  _shortdelay:
+   406 0000019C 6650                    	push eax
+   407 0000019E 6651                    	push ecx
+   408                                  %if USE_REAL_DELAY
+   409 000001A0 66B9204E0000            	mov ecx,20000
+   410                                  %else
+   411                                  	mov ecx,1
+   412                                  %endif
+   413 000001A6 B000                    	mov al,0
+   414                                  .again:
+   415 000001A8 E680                    	out 0x80,al
+   416 000001AA E2FC                    	loop .again
+   417 000001AC 6659                    	pop ecx
+   418 000001AE 6658                    	pop eax
+   419 000001B0 66C3                    o32	ret
+   420                                  
+   421                                  ; ------------------
+   422                                  _EnterKernel:
+   423                                  ;	safemsg "Cleaning flags"
+   424                                  
+   425                                  	; Clean eflags
+   426 000001B2 666A02                  	push dword 0x00000002
+   427 000001B5 669D                    	popfd
+   428                                  
+   429                                  ;	safemsg "Enabling A20"
+   430                                  
+   431 000001B7 66E859000000            	call dword _enable_A20
+   432                                  
+   433                                  ;	safemsg "Loading GDT"
+   434                                  
+   435 000001BD 670F0115[0A000000]      	lgdt [dword gdtr]
+   436                                  
+   437                                  ;	safemsg "Disabling IRQs"
+   438                                  
+   439                                  	; Disable every IRQ
+   440 000001C5 B0FF                    	mov al,0xff
+   441 000001C7 E621                    	out 0x21,al
+   442 000001C9 E6A1                    	out 0xa1,al
+   443                                  
+   444                                  ;	safemsg "Discarding pending IRQs"
+   445                                  
+   446                                  	; Throw away pending interrupts
+   447 000001CB B020                    	mov al,0x20
+   448 000001CD E620                    	out 0x20,al
+   449 000001CF E6A0                    	out 0xa0,al
+   450                                  
+   451                                  ;	safemsg "Enabling protected mode"
+   452                                  
+   453 000001D1 0F20C0                  	mov eax,cr0
+   454                                  	; Enable native FPU exception handling and enable protected mode
+   455 000001D4 6683C821                	or eax,0x00000021
+   456 000001D8 0F22C0                  	mov cr0,eax
+   457                                  
+   458 000001DB EB00                    	jmp .clear_pfq
+   459                                  .clear_pfq:
+   460                                  
+   461 000001DD 66EA[E6010000]0800      	jmp dword 0x0008:.pmode
+   462 000001E5 90                      	nop
+   463                                  .pmode:
+   464                                  [BITS 32]
+   465                                  
+   466                                  	; Load segment registers
+   467 000001E6 B810000000              	mov eax,0x10
+   468 000001EB 8ED8                    	mov ds,ax
+   469 000001ED 8EC0                    	mov es,ax
+   470 000001EF 8EE0                    	mov fs,ax
+   471 000001F1 8EE8                    	mov gs,ax
+   472                                  
+   473                                  	; Calculate temporary protected mode stack from real mode stack
+   474 000001F3 0FB7C4                  	movzx eax,sp
+   475 000001F6 6A10                    	push dword 0x0010
+   476 000001F8 50                      	push eax
+   477 000001F9 3E0FB22424              	lss esp,[ds:esp]
+   478                                  
+   479                                  ;	safemsg_pm "Initializing FPU"
+   480                                  
+   481                                  	; Reset FPU
+   482                                  ;	clts
+   483                                  ;	fninit
+   484                                  
+   485 000001FE 83C8FF                  	or eax,-1
+   486 00000201 89C3                    	mov ebx,eax
+   487 00000203 89C1                    	mov ecx,eax
+   488 00000205 89C2                    	mov edx,eax
+   489 00000207 89C6                    	mov esi,eax
+   490 00000209 89C7                    	mov edi,eax
+   491 0000020B 89C5                    	mov ebp,eax
+   492                                  
+   493                                  ;	safemsg_pm "Cleaning flags"
+   494                                  
+   495                                  	; Clean eflags
+   496 0000020D 6A02                    	push dword 0x00000002
+   497 0000020F 9D                      	popfd
+   498                                  
+   499                                  ;	safemsg_pm "Jumping to kernel"
+   500                                  
+   501                                  	; The entry point is stored in the header
+   502 00000210 FF251C001000            	jmp [0x0010001c]
+   503                                  
+   504                                  [BITS 16]
+   505                                  
+   506                                  ; ============================================================================
+   507                                  ; A20 Control
+   508                                  ; ============================================================================
+   509                                  
+   510                                  ; ------------------
+   511                                  ; Wrapper jumps off vector
+   512                                  _enable_A20:
+   513 00000216 FA                      	cli
+   514 00000217 6667833D[00000000]-     	cmp dword [dword _ena_A20_vec],0
+   515 0000021F 00                 
+   516 00000220 7508                    	jnz .detect_done
+   517 00000222 66E822010000            	call dword _detect_A20_type
+   518 00000228 720E                    	jc .failed
+   519                                  
+   520                                  .detect_done:
+   521 0000022A 6667FF15[00000000]      	call dword [dword _ena_A20_vec]
+   522                                  
+   523 00000232 66E864FFFFFF            	call dword _shortdelay
+   524                                  
+   525                                  .failed:
+   526 00000238 66C3                    o32	ret
+   527                                  
+   528                                  ; ------------------
+   529                                  ; Wrapper jumps off vector
+   530                                  _disable_A20:
+   531 0000023A 6667833D[04000000]-     	cmp dword [dword _dis_A20_vec],0
+   532 00000242 00                 
+   533 00000243 7508                    	jnz .detect_done
+   534 00000245 66E8FF000000            	call dword _detect_A20_type
+   535 0000024B 720E                    	jc .failed
+   536                                  
+   537                                  .detect_done:
+   538 0000024D 6667FF15[04000000]      	call dword [dword _dis_A20_vec]
+   539                                  
+   540 00000255 66E841FFFFFF            	call dword _shortdelay
+   541                                  
+   542                                  .failed:
+   543 0000025B FB                      	sti
+   544 0000025C 66C3                    o32	ret
+   545                                  
+   546                                  ; Null function
+   547                                  _a20_func_null:
+   548 0000025E 66C3                    o32	ret
+   549                                  
+   550                                  ; ------------------
+   551                                  ; Helpers to synchronize with keyboard controller
+   552                                  a20wait_tosend:
+   553 00000260 50                      	push ax
+   554                                  .L0:
+   555 00000261 E464                    	in al,0x64
+   556 00000263 A802                    	test al,2
+   557 00000265 75FA                    	jnz .L0
+   558 00000267 58                      	pop ax
+   559 00000268 66C3                    o32	ret
+   560                                  
+   561                                  a20wait_torecv:
+   562 0000026A 50                      	push ax
+   563                                  .L0:
+   564 0000026B E464                    	in al,0x64
+   565 0000026D A801                    	test al,1
+   566 0000026F 74FA                    	jz .L0
+   567 00000271 58                      	pop ax
+   568 00000272 66C3                    o32	ret
+   569                                  
+   570                                  ; ----------------
+   571                                  ; Use BIOS
+   572                                  _a20_func_ena_bios:
+   573 00000274 6660                    	pushad
+   574 00000276 B80124                  	mov ax,0x2401
+   575 00000279 CD15                    	int 0x15
+   576 0000027B 6661                    	popad
+   577 0000027D 66C3                    o32	ret
+   578                                  
+   579                                  _a20_func_dis_bios:
+   580 0000027F 6660                    	pushad
+   581 00000281 B80024                  	mov ax,0x2400
+   582 00000284 CD15                    	int 0x15
+   583 00000286 6661                    	popad
+   584 00000288 66C3                    o32	ret
+   585                                  
+   586                                  ; ----------------
+   587                                  ; Use keyboard controller
+   588                                  _a20_func_ena_kbc:
+   589 0000028A 6650                    	push eax
+   590 0000028C 6652                    	push edx
+   591 0000028E 66E8CCFFFFFF            	call dword a20wait_tosend
+   592 00000294 B0D1                    	mov al,0xD1
+   593 00000296 E664                    	out 0x64,al
+   594 00000298 66E8C2FFFFFF            	call dword a20wait_tosend
+   595 0000029E B0DF                    	mov al,0xDF
+   596 000002A0 E660                    	out 0x60,al
+   597 000002A2 66E8B8FFFFFF            	call dword a20wait_tosend
+   598 000002A8 665A                    	pop edx
+   599 000002AA 6658                    	pop eax
+   600 000002AC 66C3                    o32	ret
+   601                                  
+   602                                  _a20_func_dis_kbc:
+   603 000002AE 50                      	push ax
+   604 000002AF 52                      	push dx
+   605 000002B0 66E8AAFFFFFF            	call dword a20wait_tosend
+   606 000002B6 B0D1                    	mov al,0xD1
+   607 000002B8 E664                    	out 0x64,al
+   608 000002BA 66E8A0FFFFFF            	call dword a20wait_tosend
+   609 000002C0 B0DD                    	mov al,0xDD
+   610 000002C2 E660                    	out 0x60,al
+   611 000002C4 66E896FFFFFF            	call dword a20wait_tosend
+   612 000002CA 5A                      	pop dx
+   613 000002CB 58                      	pop ax
+   614 000002CC 66C3                    o32	ret
+   615                                  
+   616                                  ; ----------------
+   617                                  ; Use port 0xEE
+   618                                  _a20_func_ena_port_ee:
+   619 000002CE 50                      	push ax
+   620 000002CF E4EE                    	in al,0xEE
+   621 000002D1 58                      	pop ax
+   622 000002D2 66C3                    o32	ret
+   623                                  
+   624                                  _a20_func_dis_port_ee:
+   625 000002D4 50                      	push ax
+   626 000002D5 B000                    	mov al,0
+   627 000002D7 E6EE                    	out 0xEE,al
+   628 000002D9 58                      	pop ax
+   629 000002DA 66C3                    o32	ret
+   630                                  
+   631                                  ; ----------------
+   632                                  ; Use port 0x92
+   633                                  _a20_func_ena_port_92:
+   634 000002DC 50                      	push ax
+   635 000002DD E492                    	in al,0x92
+   636 000002DF 24FE                    	and al,~1
+   637 000002E1 0C02                    	or al,2
+   638 000002E3 E692                    	out 0x92,al
+   639 000002E5 58                      	pop ax
+   640 000002E6 66C3                    o32	ret
+   641                                  
+   642                                  _a20_func_dis_port_92:
+   643 000002E8 50                      	push ax
+   644 000002E9 E492                    	in al,0x92
+   645 000002EB 24FC                    	and al,~(1 | 2)
+   646 000002ED E692                    	out 0x92,al
+   647 000002EF 58                      	pop ax
+   648 000002F0 66C3                    o32	ret
+   649                                  
+   650                                  ; ----------------
+   651                                  ; Use keyboard controller AND port 0x92
+   652                                  _a20_func_ena_port_92_kbc:
+   653 000002F2 66E892FFFFFF            	call dword _a20_func_ena_kbc
+   654 000002F8 66E8DEFFFFFF            	call dword _a20_func_ena_port_92
+   655 000002FE 66C3                    o32	ret
+   656                                  
+   657                                  _a20_func_dis_port_92_kbc:
+   658 00000300 66E8A8FFFFFF            	call dword _a20_func_dis_kbc
+   659 00000306 66E8DCFFFFFF            	call dword _a20_func_dis_port_92
+   660 0000030C 66C3                    o32	ret
+   661                                  
+   662                                  ; ----------------
+   663                                  ; Use keyboard controller special command
+   664                                  _a20_func_ena_kbc_cmd:
+   665 0000030E 50                      	push ax
+   666 0000030F 66E84BFFFFFF            	call dword a20wait_tosend
+   667 00000315 B0DF                    	mov al,0xDF
+   668 00000317 E664                    	out 0x64,al
+   669                                  	; Twice!
+   670 00000319 66E841FFFFFF            	call dword a20wait_tosend
+   671 0000031F B0DF                    	mov al,0xDF
+   672 00000321 E664                    	out 0x64,al
+   673 00000323 66E837FFFFFF            	call dword a20wait_tosend
+   674 00000329 58                      	pop ax
+   675 0000032A 66C3                    o32	ret
+   676                                  
+   677                                  _a20_func_dis_kbc_cmd:
+   678 0000032C 50                      	push ax
+   679 0000032D 66E82DFFFFFF            	call dword a20wait_tosend
+   680 00000333 B0DD                    	mov al,0xDD
+   681 00000335 E664                    	out 0x64,al
+   682                                  	; Twice!
+   683 00000337 66E823FFFFFF            	call dword a20wait_tosend
+   684 0000033D B0DD                    	mov al,0xDD
+   685 0000033F E664                    	out 0x64,al
+   686 00000341 66E819FFFFFF            	call dword a20wait_tosend
+   687 00000347 58                      	pop ax
+   688 00000348 66C3                    o32	ret
+   689                                  
+   690                                  ; ----------------
+   691                                  ; Detect the type of A20 control this chipset uses
+   692                                  [GLOBAL _detect_A20_type]
+   693                                  _detect_A20_type:
+   694 0000034A 669C                    	pushfd
+   695 0000034C FA                      	cli
+   696 0000034D 6660                    	pushad
+   697                                  
+   698                                  	safemsg "Probing for A20 control method"
+   699                              <1> %if 1
+   700 0000034F EB21                <1>  jmp %%overtext
+   701 00000351 0A50726F62696E6720- <1> %%msg: db 10,%1,10,0
+   702 0000035A 666F72204132302063- <1>
+   703 00000363 6F6E74726F6C206D65- <1>
+   704 0000036C 74686F640A00        <1>
+   705                              <1> %%overtext:
+   706 00000372 6660                <1>  pushad
+   707 00000374 6606                <1> o32 push es
+   708 00000376 B800B8              <1>  mov ax,0xb800
+   709 00000379 8EC0                <1>  mov es,ax
+   710 0000037B 66BE[51030000]      <1>  mov esi,%%msg
+   711 00000381 31FF                <1>  xor di,di
+   712                              <1> %%another:
+   713 00000383 AC                  <1>  lodsb
+   714 00000384 3C00                <1>  cmp al,0
+   715 00000386 7406                <1>  jz %%done
+   716 00000388 AA                  <1>  stosb
+   717 00000389 B007                <1>  mov al,7
+   718 0000038B AA                  <1>  stosb
+   719 0000038C EBF5                <1>  jmp %%another
+   720                              <1> %%done:
+   721                              <1> 
+   722 0000038E B80008              <1>  mov ax,0x0800
+   723                              <1> %%another2:
+   724 00000391 AB                  <1>  stosw
+   725 00000392 81FFA000            <1>  cmp di,80*2
+   726 00000396 72F9                <1>  jb %%another2
+   727                              <1> 
+   728                              <1> %if USE_MSG_DELAY
+   729                              <1>  mov ecx,200000000
+   730                              <1> %else
+   731 00000398 66B901000000        <1>  mov ecx,1
+   732                              <1> %endif
+   733                              <1> 
+   734                              <1> %%spin:
+   735 0000039E 6649                <1>  dec ecx
+   736 000003A0 75FC                <1>  jnz %%spin
+   737                              <1> 
+   738 000003A2 6607                <1> o32 pop es
+   739 000003A4 6661                <1>  popad
+   740                              <1> %endif
+   741                                  
+   742                                  	; Use gs register for wraparound segment
+   743 000003A6 B8FFFF                  	mov ax,0xffff
+   744 000003A9 8EE8                    	mov gs,ax
+   745                                  
+   746                                  	;
+   747                                  	; See if A20 is already enabled
+   748                                  	;
+   749                                  
+   750 000003AB 66E882030000            	call dword .test_wraparound
+   751 000003B1 747C                    	jz .null_A20
+   752                                  
+   753                                  	; At this point, I know the A20 line is disabled
+   754                                  
+   755                                  	;
+   756                                  	; The safest method is to use the BIOS, so try to use that first
+   757                                  	;
+   758                                  
+   759 000003B3 66E8BBFEFFFF            	call dword _a20_func_ena_bios
+   760 000003B9 0F83D600                	jnc .bios_A20
+   761                                  .bios_A20_failed:
+   762                                  
+   763                                  	;
+   764                                  	; Try to use the keyboard controller
+   765                                  	;
+   766                                  
+   767 000003BD 66E8C7FEFFFF            	call dword _a20_func_ena_kbc
+   768                                  
+   769 000003C3 66E86A030000            	call dword .test_wraparound
+   770 000003C9 0F843401                	jz .kbc_A20
+   771                                  
+   772                                  	; Turn it off, so I can see if I need to set BOTH kbc and port 0x92 later
+   773 000003CD 66E8DBFEFFFF            	call dword _a20_func_dis_kbc
+   774                                  
+   775                                  	;
+   776                                  	; Try to use port 0xEE
+   777                                  	;
+   778                                  
+   779 000003D3 66E8F5FEFFFF            	call dword _a20_func_ena_port_ee
+   780                                  
+   781 000003D9 66E854030000            	call dword .test_wraparound
+   782 000003DF 0F848701                	jz .kbc_port_EE
+   783                                  
+   784                                  	; Turn it off
+   785 000003E3 66E8EBFEFFFF            	call dword _a20_func_dis_port_ee
+   786                                  
+   787                                  	;
+   788                                  	; Try to use port 0x92
+   789                                  	;
+   790                                  
+   791 000003E9 66E8EDFEFFFF            	call dword _a20_func_ena_port_92
+   792                                  
+   793 000003EF 66E83E030000            	call dword .test_wraparound
+   794 000003F5 0F84DE01                	jz .kbc_port_92
+   795                                  
+   796                                  	; Turn it off
+   797 000003F9 66E8E9FEFFFF            	call dword _a20_func_dis_port_92
+   798                                  
+   799                                  	;
+   800                                  	; Try to use BOTH port 0x92 and kbc
+   801                                  	;
+   802                                  
+   803 000003FF 66E8EDFEFFFF            	call dword _a20_func_ena_port_92_kbc
+   804                                  
+   805 00000405 66E828030000            	call dword .test_wraparound
+   806 0000040B 0F843502                	jz .kbc_port_92_kbc
+   807                                  
+   808                                  	; Turn it off
+   809 0000040F 66E8EBFEFFFF            	call dword _a20_func_dis_port_92_kbc
+   810                                  
+   811                                  	;
+   812                                  	; Try issuing keyboard controller command (HP Vectra)
+   813                                  	;
+   814                                  
+   815 00000415 66E8F3FEFFFF            	call dword _a20_func_ena_kbc_cmd
+   816                                  
+   817 0000041B 66E812030000            	call dword .test_wraparound
+   818 00000421 0F849302                	jz .kbc_cmd
+   819                                  
+   820 00000425 66E8E3FEFFFF            	call dword _a20_func_ena_kbc_cmd
+   821                                  
+   822                                  	;
+   823                                  	; Forget it. This motherboard is too incompatible.
+   824                                  	;
+   825                                  
+   826 0000042B F9                      	stc
+   827 0000042C E9F902                  	jmp .done
+   828                                  
+   829                                  .null_A20:
+   830                                  	safemsg "A20: Already on"
+   831                              <1> %if 1
+   832 0000042F EB12                <1>  jmp %%overtext
+   833 00000431 0A4132303A20416C72- <1> %%msg: db 10,%1,10,0
+   834 0000043A 65616479206F6E0A00  <1>
+   835                              <1> %%overtext:
+   836 00000443 6660                <1>  pushad
+   837 00000445 6606                <1> o32 push es
+   838 00000447 B800B8              <1>  mov ax,0xb800
+   839 0000044A 8EC0                <1>  mov es,ax
+   840 0000044C 66BE[31040000]      <1>  mov esi,%%msg
+   841 00000452 31FF                <1>  xor di,di
+   842                              <1> %%another:
+   843 00000454 AC                  <1>  lodsb
+   844 00000455 3C00                <1>  cmp al,0
+   845 00000457 7406                <1>  jz %%done
+   846 00000459 AA                  <1>  stosb
+   847 0000045A B007                <1>  mov al,7
+   848 0000045C AA                  <1>  stosb
+   849 0000045D EBF5                <1>  jmp %%another
+   850                              <1> %%done:
+   851                              <1> 
+   852 0000045F B80008              <1>  mov ax,0x0800
+   853                              <1> %%another2:
+   854 00000462 AB                  <1>  stosw
+   855 00000463 81FFA000            <1>  cmp di,80*2
+   856 00000467 72F9                <1>  jb %%another2
+   857                              <1> 
+   858                              <1> %if USE_MSG_DELAY
+   859                              <1>  mov ecx,200000000
+   860                              <1> %else
+   861 00000469 66B901000000        <1>  mov ecx,1
+   862                              <1> %endif
+   863                              <1> 
+   864                              <1> %%spin:
+   865 0000046F 6649                <1>  dec ecx
+   866 00000471 75FC                <1>  jnz %%spin
+   867                              <1> 
+   868 00000473 6607                <1> o32 pop es
+   869 00000475 6661                <1>  popad
+   870                              <1> %endif
+   871                                  	; The A20 line was already enabled. Don't touch it ever.
+   872 00000477 6667C705[00000000]-     	mov dword [dword _ena_A20_vec],_a20_func_null
+   873 0000047F [5E020000]         
+   874 00000483 6667C705[04000000]-     	mov dword [dword _dis_A20_vec],_a20_func_null
+   875 0000048B [5E020000]         
+   876 0000048F F8                      	clc
+   877 00000490 E99502                  	jmp .done
+   878                                  
+   879                                  .bios_A20:
+   880                                  	safemsg "A20: Using BIOS"
+   881                              <1> %if 1
+   882 00000493 EB12                <1>  jmp %%overtext
+   883 00000495 0A4132303A20557369- <1> %%msg: db 10,%1,10,0
+   884 0000049E 6E672042494F530A00  <1>
+   885                              <1> %%overtext:
+   886 000004A7 6660                <1>  pushad
+   887 000004A9 6606                <1> o32 push es
+   888 000004AB B800B8              <1>  mov ax,0xb800
+   889 000004AE 8EC0                <1>  mov es,ax
+   890 000004B0 66BE[95040000]      <1>  mov esi,%%msg
+   891 000004B6 31FF                <1>  xor di,di
+   892                              <1> %%another:
+   893 000004B8 AC                  <1>  lodsb
+   894 000004B9 3C00                <1>  cmp al,0
+   895 000004BB 7406                <1>  jz %%done
+   896 000004BD AA                  <1>  stosb
+   897 000004BE B007                <1>  mov al,7
+   898 000004C0 AA                  <1>  stosb
+   899 000004C1 EBF5                <1>  jmp %%another
+   900                              <1> %%done:
+   901                              <1> 
+   902 000004C3 B80008              <1>  mov ax,0x0800
+   903                              <1> %%another2:
+   904 000004C6 AB                  <1>  stosw
+   905 000004C7 81FFA000            <1>  cmp di,80*2
+   906 000004CB 72F9                <1>  jb %%another2
+   907                              <1> 
+   908                              <1> %if USE_MSG_DELAY
+   909                              <1>  mov ecx,200000000
+   910                              <1> %else
+   911 000004CD 66B901000000        <1>  mov ecx,1
+   912                              <1> %endif
+   913                              <1> 
+   914                              <1> %%spin:
+   915 000004D3 6649                <1>  dec ecx
+   916 000004D5 75FC                <1>  jnz %%spin
+   917                              <1> 
+   918 000004D7 6607                <1> o32 pop es
+   919 000004D9 6661                <1>  popad
+   920                              <1> %endif
+   921                                  	; Turn it off again, I was just testing
+   922 000004DB 66E89EFDFFFF            	call dword _a20_func_dis_bios
+   923 000004E1 0F82D8FE                	jc .bios_A20_failed
+   924                                  	; Success
+   925 000004E5 6667C705[00000000]-     	mov dword [dword _ena_A20_vec],_a20_func_ena_bios
+   926 000004ED [74020000]         
+   927 000004F1 6667C705[04000000]-     	mov dword [dword _dis_A20_vec],_a20_func_dis_bios
+   928 000004F9 [7F020000]         
+   929 000004FD F8                      	clc
+   930 000004FE E92702                  	jmp .done
+   931                                  
+   932                                  .kbc_A20:
+   933                                  	safemsg "A20: Using KBC"
+   934                              <1> %if 1
+   935 00000501 EB11                <1>  jmp %%overtext
+   936 00000503 0A4132303A20557369- <1> %%msg: db 10,%1,10,0
+   937 0000050C 6E67204B42430A00    <1>
+   938                              <1> %%overtext:
+   939 00000514 6660                <1>  pushad
+   940 00000516 6606                <1> o32 push es
+   941 00000518 B800B8              <1>  mov ax,0xb800
+   942 0000051B 8EC0                <1>  mov es,ax
+   943 0000051D 66BE[03050000]      <1>  mov esi,%%msg
+   944 00000523 31FF                <1>  xor di,di
+   945                              <1> %%another:
+   946 00000525 AC                  <1>  lodsb
+   947 00000526 3C00                <1>  cmp al,0
+   948 00000528 7406                <1>  jz %%done
+   949 0000052A AA                  <1>  stosb
+   950 0000052B B007                <1>  mov al,7
+   951 0000052D AA                  <1>  stosb
+   952 0000052E EBF5                <1>  jmp %%another
+   953                              <1> %%done:
+   954                              <1> 
+   955 00000530 B80008              <1>  mov ax,0x0800
+   956                              <1> %%another2:
+   957 00000533 AB                  <1>  stosw
+   958 00000534 81FFA000            <1>  cmp di,80*2
+   959 00000538 72F9                <1>  jb %%another2
+   960                              <1> 
+   961                              <1> %if USE_MSG_DELAY
+   962                              <1>  mov ecx,200000000
+   963                              <1> %else
+   964 0000053A 66B901000000        <1>  mov ecx,1
+   965                              <1> %endif
+   966                              <1> 
+   967                              <1> %%spin:
+   968 00000540 6649                <1>  dec ecx
+   969 00000542 75FC                <1>  jnz %%spin
+   970                              <1> 
+   971 00000544 6607                <1> o32 pop es
+   972 00000546 6661                <1>  popad
+   973                              <1> %endif
+   974                                  	; Turn it off again, I was just testing
+   975 00000548 66E860FDFFFF            	call dword _a20_func_dis_kbc
+   976                                  	; Success
+   977 0000054E 6667C705[00000000]-     	mov dword [dword _ena_A20_vec],_a20_func_ena_kbc
+   978 00000556 [8A020000]         
+   979 0000055A 6667C705[04000000]-     	mov dword [dword _dis_A20_vec],_a20_func_dis_kbc
+   980 00000562 [AE020000]         
+   981 00000566 F8                      	clc
+   982 00000567 E9BE01                  	jmp .done
+   983                                  
+   984                                  .kbc_port_EE:
+   985                                  	safemsg "A20: Using port EE"
+   986                              <1> %if 1
+   987 0000056A EB15                <1>  jmp %%overtext
+   988 0000056C 0A4132303A20557369- <1> %%msg: db 10,%1,10,0
+   989 00000575 6E6720706F72742045- <1>
+   990 0000057E 450A00              <1>
+   991                              <1> %%overtext:
+   992 00000581 6660                <1>  pushad
+   993 00000583 6606                <1> o32 push es
+   994 00000585 B800B8              <1>  mov ax,0xb800
+   995 00000588 8EC0                <1>  mov es,ax
+   996 0000058A 66BE[6C050000]      <1>  mov esi,%%msg
+   997 00000590 31FF                <1>  xor di,di
+   998                              <1> %%another:
+   999 00000592 AC                  <1>  lodsb
+  1000 00000593 3C00                <1>  cmp al,0
+  1001 00000595 7406                <1>  jz %%done
+  1002 00000597 AA                  <1>  stosb
+  1003 00000598 B007                <1>  mov al,7
+  1004 0000059A AA                  <1>  stosb
+  1005 0000059B EBF5                <1>  jmp %%another
+  1006                              <1> %%done:
+  1007                              <1> 
+  1008 0000059D B80008              <1>  mov ax,0x0800
+  1009                              <1> %%another2:
+  1010 000005A0 AB                  <1>  stosw
+  1011 000005A1 81FFA000            <1>  cmp di,80*2
+  1012 000005A5 72F9                <1>  jb %%another2
+  1013                              <1> 
+  1014                              <1> %if USE_MSG_DELAY
+  1015                              <1>  mov ecx,200000000
+  1016                              <1> %else
+  1017 000005A7 66B901000000        <1>  mov ecx,1
+  1018                              <1> %endif
+  1019                              <1> 
+  1020                              <1> %%spin:
+  1021 000005AD 6649                <1>  dec ecx
+  1022 000005AF 75FC                <1>  jnz %%spin
+  1023                              <1> 
+  1024 000005B1 6607                <1> o32 pop es
+  1025 000005B3 6661                <1>  popad
+  1026                              <1> %endif
+  1027                                  	; Turn it off again, I was just testing
+  1028 000005B5 66E819FDFFFF            	call dword _a20_func_dis_port_ee
+  1029                                  	; Success
+  1030 000005BB 6667C705[00000000]-     	mov dword [dword _ena_A20_vec],_a20_func_ena_port_ee
+  1031 000005C3 [CE020000]         
+  1032 000005C7 6667C705[04000000]-     	mov dword [dword _dis_A20_vec],_a20_func_dis_port_ee
+  1033 000005CF [D4020000]         
+  1034 000005D3 F8                      	clc
+  1035 000005D4 E95101                  	jmp .done
+  1036                                  
+  1037                                  .kbc_port_92:
+  1038                                  	safemsg "A20: Using port 92"
+  1039                              <1> %if 1
+  1040 000005D7 EB15                <1>  jmp %%overtext
+  1041 000005D9 0A4132303A20557369- <1> %%msg: db 10,%1,10,0
+  1042 000005E2 6E6720706F72742039- <1>
+  1043 000005EB 320A00              <1>
+  1044                              <1> %%overtext:
+  1045 000005EE 6660                <1>  pushad
+  1046 000005F0 6606                <1> o32 push es
+  1047 000005F2 B800B8              <1>  mov ax,0xb800
+  1048 000005F5 8EC0                <1>  mov es,ax
+  1049 000005F7 66BE[D9050000]      <1>  mov esi,%%msg
+  1050 000005FD 31FF                <1>  xor di,di
+  1051                              <1> %%another:
+  1052 000005FF AC                  <1>  lodsb
+  1053 00000600 3C00                <1>  cmp al,0
+  1054 00000602 7406                <1>  jz %%done
+  1055 00000604 AA                  <1>  stosb
+  1056 00000605 B007                <1>  mov al,7
+  1057 00000607 AA                  <1>  stosb
+  1058 00000608 EBF5                <1>  jmp %%another
+  1059                              <1> %%done:
+  1060                              <1> 
+  1061 0000060A B80008              <1>  mov ax,0x0800
+  1062                              <1> %%another2:
+  1063 0000060D AB                  <1>  stosw
+  1064 0000060E 81FFA000            <1>  cmp di,80*2
+  1065 00000612 72F9                <1>  jb %%another2
+  1066                              <1> 
+  1067                              <1> %if USE_MSG_DELAY
+  1068                              <1>  mov ecx,200000000
+  1069                              <1> %else
+  1070 00000614 66B901000000        <1>  mov ecx,1
+  1071                              <1> %endif
+  1072                              <1> 
+  1073                              <1> %%spin:
+  1074 0000061A 6649                <1>  dec ecx
+  1075 0000061C 75FC                <1>  jnz %%spin
+  1076                              <1> 
+  1077 0000061E 6607                <1> o32 pop es
+  1078 00000620 6661                <1>  popad
+  1079                              <1> %endif
+  1080                                  	; Turn it off again, I was just testing
+  1081 00000622 66E8C0FCFFFF            	call dword _a20_func_dis_port_92
+  1082                                  	; Success
+  1083 00000628 6667C705[00000000]-     	mov dword [dword _ena_A20_vec],_a20_func_ena_port_92
+  1084 00000630 [DC020000]         
+  1085 00000634 6667C705[04000000]-     	mov dword [dword _dis_A20_vec],_a20_func_dis_port_92
+  1086 0000063C [E8020000]         
+  1087 00000640 F8                      	clc
+  1088 00000641 E9E400                  	jmp .done
+  1089                                  
+  1090                                  .kbc_port_92_kbc:
+  1091                                  	safemsg "A20: Using port 92 and kbc"
+  1092                              <1> %if 1
+  1093 00000644 EB1D                <1>  jmp %%overtext
+  1094 00000646 0A4132303A20557369- <1> %%msg: db 10,%1,10,0
+  1095 0000064F 6E6720706F72742039- <1>
+  1096 00000658 3220616E64206B6263- <1>
+  1097 00000661 0A00                <1>
+  1098                              <1> %%overtext:
+  1099 00000663 6660                <1>  pushad
+  1100 00000665 6606                <1> o32 push es
+  1101 00000667 B800B8              <1>  mov ax,0xb800
+  1102 0000066A 8EC0                <1>  mov es,ax
+  1103 0000066C 66BE[46060000]      <1>  mov esi,%%msg
+  1104 00000672 31FF                <1>  xor di,di
+  1105                              <1> %%another:
+  1106 00000674 AC                  <1>  lodsb
+  1107 00000675 3C00                <1>  cmp al,0
+  1108 00000677 7406                <1>  jz %%done
+  1109 00000679 AA                  <1>  stosb
+  1110 0000067A B007                <1>  mov al,7
+  1111 0000067C AA                  <1>  stosb
+  1112 0000067D EBF5                <1>  jmp %%another
+  1113                              <1> %%done:
+  1114                              <1> 
+  1115 0000067F B80008              <1>  mov ax,0x0800
+  1116                              <1> %%another2:
+  1117 00000682 AB                  <1>  stosw
+  1118 00000683 81FFA000            <1>  cmp di,80*2
+  1119 00000687 72F9                <1>  jb %%another2
+  1120                              <1> 
+  1121                              <1> %if USE_MSG_DELAY
+  1122                              <1>  mov ecx,200000000
+  1123                              <1> %else
+  1124 00000689 66B901000000        <1>  mov ecx,1
+  1125                              <1> %endif
+  1126                              <1> 
+  1127                              <1> %%spin:
+  1128 0000068F 6649                <1>  dec ecx
+  1129 00000691 75FC                <1>  jnz %%spin
+  1130                              <1> 
+  1131 00000693 6607                <1> o32 pop es
+  1132 00000695 6661                <1>  popad
+  1133                              <1> %endif
+  1134                                  	; Turn it off again, I was just testing
+  1135 00000697 66E863FCFFFF            	call dword _a20_func_dis_port_92_kbc
+  1136                                  	; Success
+  1137 0000069D 6667C705[00000000]-     	mov dword [dword _ena_A20_vec],_a20_func_ena_port_92_kbc
+  1138 000006A5 [F2020000]         
+  1139 000006A9 6667C705[04000000]-     	mov dword [dword _dis_A20_vec],_a20_func_dis_port_92_kbc
+  1140 000006B1 [00030000]         
+  1141 000006B5 F8                      	clc
+  1142 000006B6 EB70                    	jmp .done
+  1143                                  
+  1144                                  .kbc_cmd:
+  1145                                  	safemsg "A20: Using KBC command"
+  1146                              <1> %if 1
+  1147 000006B8 EB19                <1>  jmp %%overtext
+  1148 000006BA 0A4132303A20557369- <1> %%msg: db 10,%1,10,0
+  1149 000006C3 6E67204B424320636F- <1>
+  1150 000006CC 6D6D616E640A00      <1>
+  1151                              <1> %%overtext:
+  1152 000006D3 6660                <1>  pushad
+  1153 000006D5 6606                <1> o32 push es
+  1154 000006D7 B800B8              <1>  mov ax,0xb800
+  1155 000006DA 8EC0                <1>  mov es,ax
+  1156 000006DC 66BE[BA060000]      <1>  mov esi,%%msg
+  1157 000006E2 31FF                <1>  xor di,di
+  1158                              <1> %%another:
+  1159 000006E4 AC                  <1>  lodsb
+  1160 000006E5 3C00                <1>  cmp al,0
+  1161 000006E7 7406                <1>  jz %%done
+  1162 000006E9 AA                  <1>  stosb
+  1163 000006EA B007                <1>  mov al,7
+  1164 000006EC AA                  <1>  stosb
+  1165 000006ED EBF5                <1>  jmp %%another
+  1166                              <1> %%done:
+  1167                              <1> 
+  1168 000006EF B80008              <1>  mov ax,0x0800
+  1169                              <1> %%another2:
+  1170 000006F2 AB                  <1>  stosw
+  1171 000006F3 81FFA000            <1>  cmp di,80*2
+  1172 000006F7 72F9                <1>  jb %%another2
+  1173                              <1> 
+  1174                              <1> %if USE_MSG_DELAY
+  1175                              <1>  mov ecx,200000000
+  1176                              <1> %else
+  1177 000006F9 66B901000000        <1>  mov ecx,1
+  1178                              <1> %endif
+  1179                              <1> 
+  1180                              <1> %%spin:
+  1181 000006FF 6649                <1>  dec ecx
+  1182 00000701 75FC                <1>  jnz %%spin
+  1183                              <1> 
+  1184 00000703 6607                <1> o32 pop es
+  1185 00000705 6661                <1>  popad
+  1186                              <1> %endif
+  1187                                  	; Turn it off again, I was just testing
+  1188 00000707 66E81FFCFFFF            	call dword _a20_func_dis_kbc_cmd
+  1189                                  	; Success
+  1190 0000070D 6667C705[00000000]-     	mov dword [dword _ena_A20_vec],_a20_func_ena_kbc_cmd
+  1191 00000715 [0E030000]         
+  1192 00000719 6667C705[04000000]-     	mov dword [dword _dis_A20_vec],_a20_func_dis_kbc_cmd
+  1193 00000721 [2C030000]         
+  1194 00000725 F8                      	clc
+  1195 00000726 EB00                    	jmp .done
+  1196                                  
+  1197                                  .done:
+  1198 00000728 6661                    	popad
+  1199 0000072A 660E                    o32	push cs
+  1200 0000072C 660FA9                  o32	pop gs
+  1201 0000072F 669D                    	popfd
+  1202 00000731 66C3                    o32	ret
+  1203                                  
+  1204                                  ; The following code is shared above to test for wraparound
+  1205                                  ; Returns with ZF set if NO wraparound occurred (the A20 line is enabled)
+  1206                                  .test_wraparound:
+  1207 00000733 66E863FAFFFF            	call dword _shortdelay
+  1208                                  
+  1209                                  	; Use INT 0x80 vector for scratch area to detect wraparound
+  1210 00000739 C70600023412            	mov word [0x80*4],0x1234
+  1211                                  	; Write to wraparound segment
+  1212 0000073F 65C70610027856          	mov word [gs:0x80*4 + 16],0x5678
+  1213                                  	; See if a wraparound occurred
+  1214 00000746 813E00023412            	cmp word [0x80*4],0x1234
+  1215 0000074C 66C3                    o32	ret
+  1216                                  
+  1217                                  [SECTION .data]
+  1218                                  [GLOBAL _footer_sig]
+  1219 00000038 E0                      _footer_sig:	db 0xE0
+  1220                                  
+  1221                                  stupid:
+  1222 00000039 00<rept>                times 1024 db 0

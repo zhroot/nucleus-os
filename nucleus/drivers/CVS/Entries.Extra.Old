@@ -1,0 +1,15 @@
+/.cvsignore///
+/block.c///
+/cmos.c///
+/cpu.c///
+/dma.c///
+/input.c///
+/pic.c///
+/video.c///
+D/block///
+D/cpu///
+D/fs///
+D/input///
+D/mem///
+D/video///
+/timer.c///
